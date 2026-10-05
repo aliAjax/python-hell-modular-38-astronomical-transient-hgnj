@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
@@ -6,6 +8,103 @@ def _find_one(lookup, kind, field, value):
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+RELAY_HORIZON_DAYS = 14
+
+# Cadence of a relay chain: segment number (1-based) -> (offset from the
+# measurement instant, exposure duration).  Offsets grow so each segment is
+# scheduled later than the previous one.
+RELAY_CADENCE = {
+    "grb": [
+        (timedelta(minutes=5), timedelta(minutes=10)),
+        (timedelta(hours=1), timedelta(minutes=15)),
+        (timedelta(hours=6), timedelta(minutes=20)),
+        (timedelta(days=1), timedelta(minutes=30)),
+        (timedelta(days=3), timedelta(minutes=30)),
+    ],
+    "supernova": [
+        (timedelta(hours=12), timedelta(minutes=30)),
+        (timedelta(days=2), timedelta(minutes=45)),
+        (timedelta(days=7), timedelta(hours=1)),
+        (timedelta(days=21), timedelta(hours=1)),
+        (timedelta(days=60), timedelta(hours=2)),
+    ],
+    "tde": [
+        (timedelta(days=1), timedelta(minutes=30)),
+        (timedelta(days=7), timedelta(hours=1)),
+        (timedelta(days=30), timedelta(hours=2)),
+        (timedelta(days=90), timedelta(hours=2)),
+    ],
+    "variable": [
+        (timedelta(days=1), timedelta(minutes=20)),
+        (timedelta(days=7), timedelta(minutes=20)),
+        (timedelta(days=30), timedelta(minutes=30)),
+    ],
+    "unknown": [
+        (timedelta(hours=1), timedelta(minutes=15)),
+        (timedelta(days=1), timedelta(minutes=30)),
+        (timedelta(days=7), timedelta(hours=1)),
+    ],
+}
+
+DEFAULT_RELAY_CADENCE = RELAY_CADENCE["unknown"]
+
+
+def _parse_iso(value):
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _format_iso(value):
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def relay_cadence(event_type, segment_no):
+    table = RELAY_CADENCE.get(event_type, DEFAULT_RELAY_CADENCE)
+    index = min(max(int(segment_no) - 1, 0), len(table) - 1)
+    return table[index]
+
+
+def next_segment_window(event_type, observed_at, segment_no):
+    """Compute the ideal window for a segment from the measurement instant."""
+    offset, duration = relay_cadence(event_type, int(segment_no))
+    start = _parse_iso(observed_at) + offset
+    return _format_iso(start), _format_iso(start + duration)
+
+
+def find_free_window(ideal_start, ideal_end, occupied):
+    """Slide the ideal window forward to the earliest slot free of overlap.
+
+    ``occupied`` is an iterable of (start, end) string intervals belonging to
+    either the telescope or the team.  Returns None when no slot opens within
+    ``RELAY_HORIZON_DAYS``.
+    """
+    start = _parse_iso(ideal_start)
+    duration = _parse_iso(ideal_end) - start
+    if duration.total_seconds() <= 0:
+        return None
+    limit = start + timedelta(days=RELAY_HORIZON_DAYS)
+    occupied_dt = []
+    for item in occupied:
+        try:
+            occupied_dt.append((_parse_iso(item[0]), _parse_iso(item[1])))
+        except (ValueError, TypeError, IndexError):
+            continue
+    candidates = {start}
+    for _, occupied_end in occupied_dt:
+        if start <= occupied_end <= limit:
+            candidates.add(occupied_end)
+    for candidate in sorted(candidates):
+        if candidate > limit:
+            continue
+        candidate_end = candidate + duration
+        if candidate_end > limit:
+            continue
+        if any(candidate < occupied_end and occupied_start < candidate_end
+               for occupied_start, occupied_end in occupied_dt):
+            continue
+        return _format_iso(candidate), _format_iso(candidate_end)
+    return None
 
 
 def calculate_priority(magnitude, transient_type):
@@ -73,13 +172,35 @@ def _validate_telescope(actor, data, lookup):
 
 
 def _validate_observation(actor, data, lookup):
-    if not _find_one(lookup, "candidate", "id", data.get("candidate_id")):
+    candidate = _find_one(lookup, "candidate", "id", data.get("candidate_id"))
+    if not candidate:
         raise ValidationError("candidate does not exist")
     if not _find_one(lookup, "telescope", "id", data.get("telescope_id")):
         raise ValidationError("telescope does not exist")
     if str(data.get("start_at")) >= str(data.get("end_at")):
         raise ValidationError("observation end must be after start")
-    return {"scheduled_team": data.get("team_id")}
+    extra = {"scheduled_team": data.get("team_id")}
+    segment_no = data.get("segment_no")
+    if segment_no is not None:
+        try:
+            segment_no = int(segment_no)
+        except (TypeError, ValueError):
+            raise ValidationError("segment_no must be an integer")
+        if segment_no < 1:
+            raise ValidationError("segment_no must be positive")
+        relay = candidate["data"].get("relay") or {}
+        last_completed = int(relay.get("last_completed", 0))
+        if segment_no > last_completed + 1:
+            raise ValidationError(
+                "next relay segment is %s, got %s" % (last_completed + 1, segment_no)
+            )
+        for obs in lookup("observation", "candidate_id", candidate["id"]) or []:
+            if obs["status"] == "withdrawn":
+                continue
+            if int(obs["data"].get("segment_no", 0) or 0) == segment_no:
+                raise ConflictError("relay segment %s already exists" % segment_no)
+        extra["segment_no"] = segment_no
+    return extra
 
 
 def _validate_merge_measurement(actor, entity, data, lookup):
@@ -210,6 +331,8 @@ class RuleEngine:
         "telescope": ("coordinator", "admin"),
         "observation": ("analyst", "coordinator", "admin"),
     }
+    RELAY_ACTIONS = frozenset({"advance_relay"})
+    RELAY_ROLES = ("analyst", "coordinator", "admin")
     ROLE_ACTIONS = {
         "activate": ("coordinator", "admin"),
         "retire": ("coordinator", "admin"),
@@ -285,3 +408,10 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_relay_advance(self, actor, entity):
+        self._ensure_role(actor, self.RELAY_ROLES)
+        if entity["kind"] != "candidate":
+            raise ValidationError("relay advance is only valid for candidates")
+        if entity["status"] == "withdrawn":
+            raise InvalidTransition("cannot advance relay for a withdrawn candidate")
