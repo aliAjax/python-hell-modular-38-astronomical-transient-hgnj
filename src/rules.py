@@ -1,4 +1,118 @@
+from datetime import datetime, timedelta, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+# --- relay-chain cadence -----------------------------------------------------
+# A transient is followed with a cadence that depends on its type.  Each entry
+# is the delay of segment N after the most recent measurement (the anchor) and
+# the default segment duration, in hours.
+CADENCE_HOURS = {
+    "grb": ([10 / 60, 1.0, 6.0, 24.0, 72.0], 0.25),
+    "supernova": ([4.0, 24.0, 72.0, 168.0, 336.0, 672.0], 0.5),
+    "tde": ([24.0, 72.0, 168.0, 336.0, 720.0, 1440.0], 0.5),
+    "variable": ([24.0, 72.0, 168.0, 336.0], 1 / 3),
+    "unknown": ([2.0, 12.0, 24.0, 72.0], 1 / 3),
+}
+TRANSIENT_TYPES = tuple(CADENCE_HOURS)
+# When the nominal window is busy, search forward up to this many hours.
+WINDOW_SEARCH_HORIZON_HOURS = 48
+WINDOW_SEARCH_STEP_MINUTES = 15
+# Pending segments are recalculated once the transient fades by this many mags.
+FADE_THRESHOLD_MAG = 2.0
+
+
+def parse_iso(value):
+    """Parse an ISO-8601 timestamp into a timezone-aware UTC datetime."""
+    if value is None:
+        raise ValidationError("timestamp is required")
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("invalid ISO-8601 timestamp: " + str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_iso(moment):
+    text = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return text[:-6] + "Z" if text.endswith("+00:00") else text
+
+
+def cadence_for(transient_type):
+    entry = CADENCE_HOURS.get(transient_type)
+    if not entry:
+        raise ValidationError("unsupported transient type: " + str(transient_type))
+    delays, duration_hours = entry
+    return list(delays), duration_hours
+
+
+def nominal_window(transient_type, segment_index, anchor_at, duration_hours=None):
+    """Nominal (start, end) UTC timestamps for a segment.
+
+    The window is measured from the latest measurement time, so re-merging a
+    measurement or reclassifying shifts the whole remaining chain.
+    """
+    delays, default_duration = cadence_for(transient_type)
+    index = int(segment_index)
+    if index < 0 or index >= len(delays):
+        raise ValidationError("segment %s is outside the %s cadence" % (segment_index, transient_type))
+    if duration_hours is None:
+        duration_hours = default_duration
+    anchor = parse_iso(anchor_at)
+    start = anchor + timedelta(hours=delays[index])
+    return format_iso(start), format_iso(start + timedelta(hours=float(duration_hours)))
+
+
+def magnitude_fade(previous_magnitude, latest_magnitude):
+    """Positive delta means the source got fainter (larger magnitude)."""
+    try:
+        return round(float(latest_magnitude) - float(previous_magnitude), 4)
+    except (TypeError, ValueError):
+        raise ValidationError("magnitudes must be numeric")
+
+
+def is_faded(previous_magnitude, latest_magnitude, threshold=FADE_THRESHOLD_MAG):
+    return magnitude_fade(previous_magnitude, latest_magnitude) > float(threshold)
+
+
+def _windows_overlap(first, second):
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def find_free_window(nominal_start, nominal_end, busy_windows,
+                     horizon_hours=WINDOW_SEARCH_HORIZON_HOURS,
+                     step_minutes=WINDOW_SEARCH_STEP_MINUTES):
+    """Slide the nominal window forward until both telescope and team are free.
+
+    busy_windows is an iterable of (start, end) committed windows.  Windows are
+    half-open so back-to-back observations never collide.  Returns the chosen
+    (start, end) or None when nothing fits inside the horizon.
+    """
+    start = parse_iso(nominal_start)
+    end = parse_iso(nominal_end)
+    duration = end - start
+    busy = sorted(
+        ((parse_iso(item[0]), parse_iso(item[1])) for item in busy_windows),
+        key=lambda item: item[0],
+    )
+    deadline = start + timedelta(hours=horizon_hours)
+    candidate_start = start
+    while candidate_start <= deadline:
+        candidate = (candidate_start, candidate_start + duration)
+        colliding_ends = [
+            item[1] for item in busy if _windows_overlap(candidate, item)
+        ]
+        if not colliding_ends:
+            return format_iso(candidate[0]), format_iso(candidate[1])
+        # Jump past every window colliding with the candidate, but never before
+        # the nominal time: booked slots cannot pull an observation earlier.
+        candidate_start = max(candidate_start + timedelta(minutes=step_minutes),
+                              max(colliding_ends))
+    return None
 
 
 def _find_one(lookup, kind, field, value):
@@ -154,12 +268,14 @@ class RuleEngine:
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "chains": "chain",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "chain": "active",
     }
     TRANSITIONS = {
         "source": {
@@ -240,6 +356,15 @@ class RuleEngine:
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    CHAIN_ACTION_ROLES = {
+        "start_chain": ("analyst", "coordinator", "admin"),
+        "complete_segment": ("operator", "coordinator", "admin"),
+        "retry_segment": ("operator", "coordinator", "admin"),
+    }
+
+    def ensure_chain_role(self, actor, action):
+        self._ensure_role(actor, self.CHAIN_ACTION_ROLES.get(action, ("admin",)))
 
     def initial_status(self, kind):
         kind = self.normalize_kind(kind)

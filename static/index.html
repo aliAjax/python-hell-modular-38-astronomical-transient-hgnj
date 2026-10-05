@@ -14,13 +14,17 @@
 <body>
 <main>
   <h1>天文瞬变事件警报与后续观测</h1>
-  <p>候选事件、测量合并、望远镜观测申请和审计通过JSON接口管理。</p>
+  <p>候选事件、测量合并、望远镜观测申请、连拍接力链和审计通过JSON接口管理。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;            # sources / candidates / telescopes / observations / chains
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
+     candidate.start_chain   {telescope_id, team_id, mode?, duration_hours?}
+     observation.complete    完成一段并在同一事务内推进下一段
+     chain.retry_segment     {segment_index?}  重试失败段，不重复占用
+     candidate.reclassify / withdraw / merge_measurement  触发后续段失效重算
 GET  /api/audit</pre>
 </main>
 <script>
